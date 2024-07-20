@@ -1,4 +1,4 @@
 {
-  "endpoint": "http://oss-cn-beijing.aliyuncs.com",
-  "bucket": "my-bucket"
+  "endpoint": "http://oss-cn-nanjing.aliyuncs.com",
+  "bucket": "rongzi-bucket"
 }

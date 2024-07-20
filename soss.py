@@ -4,8 +4,8 @@ import json
 import os
 
 import oss2
-from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
+from Crypto.Cipher    import AES
+from Crypto.Random    import get_random_bytes
 from oss2.credentials import EnvironmentVariableCredentialsProvider
 
 
@@ -33,7 +33,7 @@ class Uploader(OssClientBase):
         self.endpoint = self.normalize_endpoint(endpoint)
         self.bucket = bucket
         self.prefix = prefix
-        self.files = files
+        self.files  = files
         self.encrypt_key = self.get_encrypt_key(encrypt_key)
 
     def collect_files(self, files):
