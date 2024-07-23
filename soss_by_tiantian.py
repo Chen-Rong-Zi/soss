@@ -53,8 +53,8 @@ class Uploader(OssClientBase):
 
     def upload(self):
         file_data = self.collect_files(self.files)
-        bucket = oss2.Bucket(self.auth(), self.endpoint, self.bucket)
-        choice = None
+        bucket    = oss2.Bucket(self.auth(), self.endpoint, self.bucket)
+        choice    = None
 
         for file, key in file_data:
             key = self.prefix + key
