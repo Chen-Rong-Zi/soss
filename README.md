@@ -1,6 +1,6 @@
 # SOSS (Secure Object Storage Service)
 
-一个可以在把文件上传到阿里云OSS之前加密，下载时自动解密的小工具。
+一个可以在把文件上传到阿里云OSS的小工具，使用dry-python/returns重写为函数式风格
 
 ## 准备工作
 
@@ -19,6 +19,16 @@ pip install -r requirements.txt
 
 ## 使用说明
 
+### 上传文件
+
+```
+python soss.py upload -k my_password text.txt image.png
+
+# 支持上传整个文件夹的内容，文件夹所有内容会保持结构上传到bucket根目录
+python soss.py upload -k my_password data/
+```
+# todo
+
 ### 文件列表
 
 ```
@@ -28,24 +38,6 @@ python soss.py list --prefix data/
 
 # 如果想在命令行输入bucket和endpoint
 python soss.py list -b bucket_name -e endpoint
-```
-
-### 上传文件
-
-```
-python soss.py upload -k my_password text.txt image.png
-
-# 支持上传整个文件夹的内容，文件夹所有内容会保持结构上传到bucket根目录
-python soss.py upload -k my_password data/
-
-# 设置bucket保存路径的prefix，文件夹所有内容会保持结构上传到data/目录
-python soss.py upload -k my_password --prefix data/ data/
-
-# 如果encrypt key是一个32或者64位的hex，则直接作为AES的key使用，否则进行SHA256，转换成32 byte的key
-python soss.py upload -k deadbeef12345678deadbeef87654321 text.txt
-
-# 同样也可以传入bucket和endpoint
-python soss.py upload -b bucket -e endpoint -k my_password text.txt
 ```
 
 ### 下载文件
@@ -62,5 +54,6 @@ python soss.py download -k my_password --output_dir ./data text.txt image.png
 ### LICENSE
 
 Copyright 2024 Tian Gao.
+Copyright 2024 RongZi Chen.
 
 Distributed under the terms of the [Apache 2.0 license](LICENSE)
