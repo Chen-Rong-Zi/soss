@@ -8,16 +8,17 @@ import argparse
 import oss2
 from   oss2.credentials import EnvironmentVariableCredentialsProvider
 
-from returns.pointfree  import map_, bind
-from returns.io         import IOResultE, impure, impure_safe, IOFailure
-from returns.context    import Reader, ReaderResult, ReaderResultE, ReaderIOResultE
-from returns.result     import safe, ResultE, Failure
-from returns.pipeline   import flow, pipe
+from returns.pointfree  import map_,      bind
+from returns.io         import IOResultE, impure,       impure_safe,   IOFailure
+from returns.context    import Reader,    ReaderResult, ReaderResultE, ReaderIOResultE
+from returns.result     import safe,      ResultE,      Failure
+from returns.pipeline   import flow,      pipe
 from returns.iterables  import Fold
 from returns.curry      import curry
 from returns.converters import flatten
 
-from ListHelper        import lmap, lfilter, concat, ljoin
+from ListHelper         import lmap, lfilter, concat, ljoin
+# from viztracer          import VizTracer
 
 @impure_safe
 # read_file :: str -> IOResultE[str]
@@ -45,9 +46,8 @@ def parse_json_ioresult(string):
 def upload_data(key, data):
     @impure_safe
     def with_bucket(bucket):
-        print(f'{key = }, {data = }\n\n {bucket = }')
-        bucket.put_object(key, data)
-        return (key, data)
+        # bucket.put_object(key, data)
+        return f'{key} Uploaded Successfully'
     return Reader(with_bucket)
 
 @impure_safe
@@ -96,10 +96,10 @@ def get_key(file_path):
 def upload_one(file_path):
     # with_identifier :: dict -> IOResultE[str]
     def with_identifier(env):
-        get_key = lambda filepath : get_key(filepath)(env['identifier'])
+        key = lambda filepath : get_key(filepath)(env['identifier'])
         return flow(
             Reader.from_value(upload_data), # ReaderIOResultE[(str, Union[str, byte]) -> IOResultE[Tuple[str, Union[str, byte]], bucket], str]
-            Reader(get_key).apply,          # ReaderIOResultE[str,  str]
+            Reader(key).apply,          # ReaderIOResultE[str,  str]
             Reader(read_data).apply         # ReaderIOResultE[str,  str]
         )(file_path)(env['bucket'])
     return Reader(with_identifier)
@@ -125,22 +125,14 @@ def upload_dir(env, bucket):
         'bucket'     : bucket,
         'identifier' : env['identifier']
     }
-    # return flow(
-        # env['directory'],
-        # collect_files,                                             # IOResultE[List[str]]
-        # bind(lmap(upload_one)),                                    # IOResultE[List[Reader[IOResultE[str]]]
-        # trace,
-        # map_(lambda lst : Fold.collect(lst, Reader.from_value(()))),    # IOResultE[Reader[List[IOResultE[str]]]]
-        # trace,
-        # map_(lambda x : x(new_env)),                                    # IOResultE[List[IOResultE[str]]]
-    # )
+    print(env['directory'])
     return flatten(IOResultE.do(
         flow(
-            files,                                                 # List[str]
-            upload_one,                                            # List[Reader[IOResultE[str]]]
-            lmap(lambda x : x(new_env)),                                # List[IOResultE[str]]
-            lambda lst : Fold.collect(lst, IOResultE.from_value(()))    # IOResultE[Reader[IOResultE[List[str]]]]
-        )
+            files,                                                        # List[str]
+            lmap(upload_one),                                             # List[Reader[IOResultE[str]]]
+            lmap(ReaderIOResultE),                                        # List[ReaderIOResultE[str]]
+            lambda lst : Fold.collect(lst, ReaderIOResultE.from_value(())),    # ReaderIOResultE[List[str]]
+        )(new_env)
         for files in collect_files(env['directory'])
     ))
 
@@ -192,6 +184,14 @@ def make_env():
         for identifier in get_identifier()
     )
 
+# win_callback :: List -> IOResultE[None]
+def win_callback(lst):
+    return IOResultE.from_value(lmap(print)(lst))
+
+# win_callback :: Exception -> IOResultE[None]
+def fail_callback(error):
+    return  IOFailure(print(str(error)))
+
 def main():
     return flatten(IOResultE.do(
         upload_dir(env, bucket)
@@ -199,13 +199,5 @@ def main():
         for bucket in oss_login(env['config'])
     ))
 
-# win_callback :: List -> IOResultE[None]
-def win_callback(lst):
-    return IOFailure(lmap(print)(lst))
-
-# win_callback :: Exception -> IOResultE[None]
-def fail_callback(error):
-    return  IOFailure(print(str(error)))
-
 if __name__ == '__main__':
-    a = main().bind(win_callback).lash(fail_callback)
+    a = main().lash(fail_callback).bind(win_callback)
