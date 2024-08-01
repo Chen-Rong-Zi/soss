@@ -8,12 +8,13 @@ import argparse
 
 import oss2
 from   oss2.credentials import EnvironmentVariableCredentialsProvider
-print('pass')
 
+import returns.pointfree as pointfree
+import returns.methods   as methods
 from returns.pointfree  import map_,      bind
-from returns.io         import IOResultE, impure,       impure_safe,   IOFailure
+from returns.io         import IOResultE, impure,       impure_safe,   IOFailure, IOResult 
 from returns.context    import Reader,    ReaderResult, ReaderResultE, ReaderIOResultE
-from returns.result     import safe,      ResultE,      Failure
+from returns.result     import safe,      ResultE,      Failure, Result
 from returns.pipeline   import flow,      pipe
 from returns.iterables  import Fold
 from returns.curry      import curry
@@ -44,6 +45,15 @@ def parse_json(string):
 # parse_json_ioresult :: str -> IOResultE[dict]
 def parse_json_ioresult(string):
     return pipe(parse_json, IOResultE.from_result)(string)
+
+# str -> Reader[IOResultE[str], bucket]
+def key_exists(key):
+    @impure_safe
+    # with_bucket bucket -> bool
+    def with_bucket(bucket):
+        # return True
+        return bucket.object_exists(key)
+    return Reader(with_bucket)
 
 @curry
 # upload_data :: (str, Union[str, byte]) -> Reader[IOResultE[Union[str, byte]]]
@@ -90,7 +100,7 @@ def trace(x):
     print(f'{x = }')
     return x
 
-# get_key :: str -> Rprinieader[str]
+# get_key :: str -> Reader[str]
 def get_key(file_path):
     def with_identifier(identifier):
         return identifier['hostname'] + file_path
@@ -98,15 +108,27 @@ def get_key(file_path):
 
 # upload_one :: str -> Reader[IOResultE[str]]
 def upload_one(file_path):
-    # with_identifier :: dict -> IOResultE[str]
-    def with_identifier(env):
+    # with_env :: dict -> IOResultE[str]
+    def with_env(env):
         key = lambda filepath : get_key(filepath)(env['identifier'])
         return flow(
             Reader.from_value(upload_data), # IOResultE[Tuple[str, str|bytes], bucket], str]
             Reader(key).apply,              # ReaderIOResultE[str,  str]
             Reader(read_data).apply         # ReaderIOResultE[str,  str]
         )(file_path)(env['bucket'])
-    return Reader(with_identifier)
+    return Reader(with_env)
+
+# upload :: str- > Reader[IOResultE[str]]
+def upload(filepath):
+    # with_env :: dict -> IOResultE[str]
+    def with_env(env):
+        reader_key = impure_safe(get_key(filepath))
+        return flatten(IOResultE.do(
+            (upload_one(filepath) if not exists else lambda _ : f'{filepath} 已存在')(env)
+            for key    in reader_key(env['identifier'])
+            for exists in key_exists(key)(env['bucket'])
+        ))
+    return Reader(with_env)
 
 # is_normal_file :: str -> IOResultE
 def is_normal_file(filepath):
@@ -156,7 +178,7 @@ def upload_dir(env, bucket):
     return IOResultE.do(
         flow(
             files,                                                        # MIterator[str]
-            map_(pipe(upload_one, ReaderIOResultE)),                      # MIterator[ReaderIOResultE[str]]
+            map_(pipe(upload, ReaderIOResultE)),                      # MIterator[ReaderIOResultE[str]]
             map_(lambda x : x(new_env)),                                        # MIterator[IOResultE[str]]
         )
             # lambda lst : Fold.collect(lst, ReaderIOResultE.from_value(())),    # ReaderIOResultE[str]
@@ -213,7 +235,7 @@ def make_env():
 
 # win_callback :: List -> IOResultE[None]
 def win_callback(lst):
-    return IOResultE.from_value(lmap(trace)(lst))
+    return IOResultE.from_value(lmap(print)(lst))
 
 # win_callback :: Exception -> IOResultE[None]
 def fail_callback(error):
