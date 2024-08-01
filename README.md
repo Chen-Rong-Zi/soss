@@ -51,6 +51,10 @@ python soss.py download -k my_password --output_dir ./data text.txt image.png
 # 剩下的参数和upload一样
 ```
 
+## 8月1日更新
+- feature: 使用迭代器 减小内存占用
+- feature: 新增上传文件前云存储中判断是否存在，根据哈希值判断是否需要上传覆盖
+
 ### LICENSE
 
 Copyright 2024 Tian Gao.

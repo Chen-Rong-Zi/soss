@@ -181,7 +181,6 @@ def upload_dir(env, bucket):
             map_(pipe(upload, ReaderIOResultE)),                      # MIterator[ReaderIOResultE[str]]
             map_(lambda x : x(new_env)),                                        # MIterator[IOResultE[str]]
         )
-            # lambda lst : Fold.collect(lst, ReaderIOResultE.from_value(())),    # ReaderIOResultE[str]
         for files in collect_files(env['directory'])
     )
 
