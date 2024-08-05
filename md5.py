@@ -1,7 +1,8 @@
 import hashlib
 import base64
 
-from oss2.compat    import to_string
+from oss2.compat       import to_string
+from oss2.utils        import content_md5
 
 from returns.io        import IOResultE, IOFailure, IOSuccess
 from returns.pointfree import map_
@@ -29,3 +30,8 @@ def update_to_md5(io_buffer_reader):
             lambda err : IOResultE.from_value(m)
         )
     return helper(io_buffer_reader, hashlib.md5())
+
+class type():
+    def __init__(self, name):
+        self.name = name
+type(int)

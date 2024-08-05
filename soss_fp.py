@@ -5,27 +5,41 @@ import json
 import uuid
 import socket
 import argparse
+import threading
 
 import oss2
 from   oss2.credentials import EnvironmentVariableCredentialsProvider
 from   oss2.utils       import content_md5
 from   oss2.compat      import to_bytes
 
-import returns.pointfree as pointfree
-import returns.methods   as methods
-from returns.pointfree  import map_,      bind
-from returns.io         import IOResultE, impure,       impure_safe,   IOFailure, IOSuccess, IOResult
-from returns.context    import Reader,    ReaderResult, ReaderResultE, ReaderIOResultE
-from returns.result     import safe,      ResultE,      Failure, Result
-from returns.pipeline   import flow,      pipe
-from returns.iterables  import Fold
-from returns.curry      import curry
-from returns.converters import flatten
+import returns.pointfree  as     pointfree
+import returns.methods    as     methods
+from   returns.pointfree  import map_,      bind
+from   returns.io         import IOResultE, impure,       impure_safe,   IOFailure,      IOSuccess, IOResult
+from   returns.context    import Reader,    ReaderResult, ReaderResultE, ReaderIOResultE
+from   returns.result     import safe,      ResultE,      Failure,       Result
+from   returns.pipeline   import flow,      pipe
+from   returns.iterables  import Fold
+from   returns.curry      import curry
+from   returns.converters import flatten
 # from viztracer          import VizTracer
 
-from ListHelper         import lmap,      lfilter,   concat, ljoin
-from multivalue         import MIterator, MultiValue
-from md5                import calculate_md5 as get_local_md5
+from   ListHelper         import lmap,      lfilter,   concat, ljoin
+from   multivalue         import MIterator, MultiValue
+from   md5                import calculate_md5 as get_local_md5
+
+def ioresult_sequence(ioresult):
+    if isinstance(ioresult, IOFailure):
+        return ioresult
+    return ioresult._inner_value._inner_value.map(IOSuccess)
+
+# MIterator[IOResultE[]] -> IOResultE[MIterator[str]]
+def miterator_ioresult(mi_io):
+    def gen():
+        for ior in mi_io:
+            if isinstance(ior, IOSuccess):
+                yield ior._inner_value._inner_value
+    return IOSuccess(gen())
 
 @curry
 @safe
@@ -68,9 +82,8 @@ def upload_data(key, data):
     # print(f"{key = }, {data = }")
     @impure_safe
     def with_bucket(bucket):
-        # if hasattr(a := bucket.head_object(key), 'resp'):
-            # print(a.resp.headers)
         put_result = bucket.put_object(key, data)
+        print(f'{key} 上传成功')
         return f'{key} 上传成功'
         # return f'{key} 上传成功, etag = {put_result.etag}, crc = {put_result.crc}'
     return Reader(with_bucket)
@@ -136,33 +149,32 @@ def get_remote_md5(key):
     # with_bucket :: bucket -> IO[ResultE[str]]
     def with_bucket(bucket):
         header_result = bucket.head_object(key)
+        # print(header_result.resp.headers)
         return IOResultE.from_result(safe_get('Content-Md5')(header_result.resp.headers))
     return Reader(pipe(with_bucket, IOResultE.from_ioresult))
 
-# check_md5_integrity :: (str, str) -> IOResultE(bool)
-def check_md5_integrity(filepath, key):
+# check_md5_integrity :: str -> Reader[IOResultE[bool]]
+def check_md5_integrity(filepath):
     def with_env(env):
         return IOResultE.do(
             local_md5 == remote_md5
             for fhandle    in get_file_handler(filepath)
             for local_md5  in get_local_md5(fhandle)
-            for remote_md5 in get_remote_md5(key)(env['bucket'])
+            for remote_md5 in get_remote_md5(env['key'])(env['bucket'])
         )
     return Reader(with_env)
 
-# conditional_exit :: str -> IOResultE[str]
+# conditional_exit :: str -> Reader[IOResultE[str]]
 def conditional_exit(filepath):
-    def with_env(env):
-        return check_md5_integrity(filepath, env['key'])(env).bind(
-            lambda pass_md5_verify : IOFailure(f'{filepath} 在oss中已存在!') if pass_md5_verify else IOSuccess(f'Did not Pass md5 verification')
-        )
-        return IOFailure(f"{filepath} already exitsts in the cloud!")
-    return Reader(with_env)
+    return check_md5_integrity(filepath).map(
+        bind(lambda pass_md5_verify : print(f'{filepath} 在oss中已存在!') or IOFailure(f'{filepath} 在oss中已存在!') if pass_md5_verify else IOSuccess(f'Did not Pass md5 verification'))
+    )
 
 # conditional_upload :: str -> Reader[IOResultE[str]]
 def conditional_upload(filepath):
     # with_env :: dict -> IOResultE[str]
     def with_env(env):
+        # env.update({'key' : get_key(filepath)(env['identifier'])})
         items   = list(env.items()) + [('key', get_key(filepath)(env['identifier']))]
         new_env = dict(items)
         return key_exists(new_env['key'])(env['bucket']).bind(
@@ -174,14 +186,12 @@ def conditional_upload(filepath):
         )
     return Reader(with_env)
 
-# is_normal_file :: str -> IOResultE
+# is_normal_file :: str -> IOResultE[filepath]
 def is_normal_file(filepath):
     stat_file   = impure_safe(lambda file      : os.stat(file))
     normal_file = impure_safe(lambda file_stat : stat.S_ISREG(file_stat.st_mode))
-    return IOResultE.do(
-        is_normal
-        for filestat  in stat_file(filepath)
-        for is_normal in normal_file(filestat)
+    return stat_file(filepath).bind(
+        normal_file
     )
 
 # truey_value :: IOResultE[any] -> bool
@@ -201,7 +211,6 @@ def collect_files(directory):
             MIterator(tu[2]),
             map_(concat(tu[0] + '/'))
         )
-    # str -> bool
     normal_file = pipe(is_normal_file, truey_value)
 
     return flow(
@@ -212,20 +221,14 @@ def collect_files(directory):
         map_(lambda iterator : iterator.filter(normal_file)),              # IOResultE[MIterator[str]]
     )
 
-# upload_dir :: (str, ossbase) -> IOResultE[str]
-def upload_dir(env, bucket):
-    new_env = {
-        'bucket'     : bucket,
-        'identifier' : env['identifier']
-    }
-    print(env['directory'])
+# upload_dir :: str -> IOResultE[MIterator[ReaderIOResultE[str]]]
+def upload_dir(directory):
     return IOResultE.do(
         flow(
             files,                                                  # MIterator[str]
             map_(pipe(conditional_upload, ReaderIOResultE)),        # MIterator[ReaderIOResultE[str]]
-            map_(lambda x : x(new_env)),                                 # MIterator[IOResultE[str]]
         )
-        for files in collect_files(env['directory'])
+        for files in collect_files(directory)
     )
 
 # oss_login :: dict -> IOResultE[oss2.Bucket]
@@ -257,31 +260,35 @@ def make_env(args):
         {
             'config'     : config,
             'identifier' : identifier,
-            'directory'  : args.directory,
         }
         for config     in read_config(args.config)
         for identifier in get_identifier()
     )
 
-# win_callback :: List[IOResultE[str]] -> IOResultE[None]
-def win_callback(lst):
-    # return IOResultE.from_value(1)
-    return IOResultE.from_value(
-        lmap(lambda x : print(x._inner_value._inner_value))(lst)
-    )
+# win_callback :: MIterator[IOResultE[str]]
+def win_callback(iter_reader_ioresult):
+    for task in iter_reader_ioresult:
+        t = threading.Thread(target=task)
+        t.start()
+    return IOSuccess(0)
 
 # win_callback :: Exception -> IOResultE[None]
 def fail_callback(error):
     return  IOFailure(print(error))
 
-# upload_dir_ :: args -> IOResultE[str]
+# upload :: args -> IOResultE[MIterator[Callable[[], IOResultE[str]]]]
 def upload(args):
-    a = flatten(IOResultE.do(
-        upload_dir(env, bucket)            # IOResultE[str]
-        for env    in make_env(args)
-        for bucket in oss_login(env['config'])
-    ))
-    return a
+    # return upload_dir(args.directory)
+    new_env = lambda env, bucket : {
+        'bucket'     : bucket,
+        'identifier' : env['identifier']
+    }
+    return IOResultE.do(
+        iter_reader_ioresult.map(lambda reader : lambda :(reader(new_env(env, bucket))))
+        for iter_reader_ioresult in upload_dir(args.directory)
+        for env                  in make_env(args)
+        for bucket               in oss_login(env['config'])
+    )
 
 # () -> IOResultE[argparse.NameSpace]
 def main():
@@ -297,12 +304,12 @@ def main():
 
     args = parser.parse_args()
     if args.command == 'upload':
-        a = upload(args)
-        return a
-    elif args.command == 'update-meta':
-        return IOResultE.from_value(0)
+        return upload(args)
     else:
-        return IOResultE.from_failure(Failure('未指定的的命令'))
+        return IOFailure('未指定的的命令')
 
 if __name__ == '__main__':
-    main().lash(fail_callback).bind(win_callback)
+    try:
+        main().lash(fail_callback).bind(win_callback)
+    except KeyboardInterrupt:
+        print('\nSoss Exit\n')
