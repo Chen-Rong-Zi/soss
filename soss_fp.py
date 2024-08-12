@@ -312,6 +312,7 @@ def main():
         return IOFailure('未指定的的命令')
 
 if __name__ == '__main__':
+    # get_key :: Path -> Reader[str]
     if os.name == 'nt':
         get_key = nt_get_key
     else:
