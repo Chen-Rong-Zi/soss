@@ -223,7 +223,7 @@ def collect_files(directory_path):
 # upload_dir :: str -> IOResultE[MIterator[ReaderIOResultE[str]]]
 def upload_dir(directory):
     return IOSuccess(directory).map(
-        pipe(os.path.normcase, os.path.normalpath, Path)
+        pipe(os.path.normcase, os.path.normpath, Path)
     ).bind(
         lambda path : IOSuccess(path) if path.is_dir() else IOFailure(f'"{path}" is not exists, thus can not be collected') 
     ).bind(
