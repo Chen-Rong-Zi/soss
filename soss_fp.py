@@ -132,7 +132,7 @@ def posix_get_key(path):
 # nt_get_key :: Path -> Reader[str]
 def nt_get_key(path):
     def with_identifier(identifier):
-        return identifier['hostname'] + '/' + path.as_posix()
+        return identifier['hostname'] + '/' + os.path.normcase(path.as_posix())
     return Reader(with_identifier)
 
 # upload_one :: str -> Reader[IOResultE[str]]
@@ -223,7 +223,7 @@ def collect_files(directory_path):
 # upload_dir :: str -> IOResultE[MIterator[ReaderIOResultE[str]]]
 def upload_dir(directory):
     return IOSuccess(directory).map(
-        pipe(os.path.normcase, Path)
+        pipe(os.path.normcase, os.path.normalpath, Path)
     ).bind(
         lambda path : IOSuccess(path) if path.is_dir() else IOFailure(f'"{path}" is not exists, thus can not be collected') 
     ).bind(
