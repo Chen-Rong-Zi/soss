@@ -6,6 +6,7 @@ import uuid
 import socket
 import argparse
 import threading
+from   pathlib   import Path, PurePath
 
 import oss2
 from   oss2.credentials import EnvironmentVariableCredentialsProvider
@@ -79,13 +80,11 @@ def key_exists(key):
 @curry
 # upload_data :: (str, Union[str, byte]) -> Reader[IOResultE[Union[str, byte]]]
 def upload_data(key, data):
-    # print(f"{key = }, {data = }")
     @impure_safe
     def with_bucket(bucket):
         put_result = bucket.put_object(key, data)
         print(f'{key} 上传成功')
         return f'{key} 上传成功'
-        # return f'{key} 上传成功, etag = {put_result.etag}, crc = {put_result.crc}'
     return Reader(with_bucket)
 
 @impure_safe
@@ -121,13 +120,19 @@ def get_identifier():
     )
 
 def trace(x):
-    print(f'{x = }')
+    print(f'trace: {x}')
     return x
 
-# get_key :: str -> Reader[str]
-def get_key(file_path):
+# posix_get_key :: Path -> Reader[str]
+def posix_get_key(path):
     def with_identifier(identifier):
-        return identifier['hostname'] + file_path
+        return identifier['hostname'] + str(path)
+    return Reader(with_identifier)
+
+# nt_get_key :: Path -> Reader[str]
+def nt_get_key(path):
+    def with_identifier(identifier):
+        return identifier['hostname'] + '/' + path.as_posix()
     return Reader(with_identifier)
 
 # upload_one :: str -> Reader[IOResultE[str]]
@@ -149,8 +154,7 @@ def get_remote_md5(key):
     # with_bucket :: bucket -> IO[ResultE[str]]
     def with_bucket(bucket):
         header_result = bucket.head_object(key)
-        # print(header_result.resp.headers)
-        return IOResultE.from_result(safe_get('Content-Md5')(header_result.resp.headers))
+        return IOSuccess(safe_get('Content-Md5')(header_result.resp.headers))
     return Reader(pipe(with_bucket, IOResultE.from_ioresult))
 
 # check_md5_integrity :: str -> Reader[IOResultE[bool]]
@@ -167,7 +171,7 @@ def check_md5_integrity(filepath):
 # conditional_exit :: str -> Reader[IOResultE[str]]
 def conditional_exit(filepath):
     return check_md5_integrity(filepath).map(
-        bind(lambda pass_md5_verify : print(f'{filepath} 在oss中已存在!') or IOFailure(f'{filepath} 在oss中已存在!') if pass_md5_verify else IOSuccess(f'Did not Pass md5 verification'))
+        bind(lambda pass_md5_verify : IOFailure(f'{filepath} 在oss中已存在!') if pass_md5_verify else IOSuccess(f'Did not Pass md5 verification'))
     )
 
 # conditional_upload :: str -> Reader[IOResultE[str]]
@@ -186,59 +190,55 @@ def conditional_upload(filepath):
         )
     return Reader(with_env)
 
-# is_normal_file :: str -> IOResultE[filepath]
-def is_normal_file(filepath):
-    stat_file   = impure_safe(lambda file      : os.stat(file))
-    normal_file = impure_safe(lambda file_stat : stat.S_ISREG(file_stat.st_mode))
-    return stat_file(filepath).bind(
-        normal_file
-    )
+# is_normal_file :: Path -> IOResultE[Path]
+def is_normal_file(path):
+    return IOSuccess(path.is_file())
 
 # truey_value :: IOResultE[any] -> bool
 def truey_value(ior_value):
-    return ior_value == IOResultE.from_value(True)
+    return ior_value == IOSuccess(True)
 
-# str -> IOResultE[MIterator[str]]
-def collect_files(directory):
-    if not os.path.isdir(directory):
-        return IOFailure(FileNotFoundError(f'"{directory}" is not exists, thus can not be collected'))
-    if not os.path.isdir(directory):
-        return IOFailure(IsADirectoryError(f'"{directory}" is not a directory, thus cant not be collected'))
+# str -> IOResultE[MIterator[Path]]
+def collect_files(directory_path):
 
     # Tuple[str, str, List[str]] -> MIterator[str]
     def tu0_plus_tu2(tu):
+        current_dir = Path(tu[0])
         return flow(
             MIterator(tu[2]),
-            map_(concat(tu[0] + '/'))
+            map_(current_dir.joinpath)
         )
+
     normal_file = pipe(is_normal_file, truey_value)
 
     return flow(
-        IOResultE.from_value(directory),                              # IOResultE[str]
-        bind(impure_safe(os.path.abspath)),                           # IOResultE[Str]
-        bind(impure_safe(pipe(os.walk, MIterator))),                  # IOResultE[MIterator[Tuple[Str]]]
+        IOSuccess(directory_path),
+        bind(impure_safe(Path.absolute)),                             # IOResultE[Str]
+        bind(impure_safe(Path.resolve)),                              # IOResultE[Str]
+        bind(impure_safe(pipe(Path.walk, MIterator))),                # IOResultE[MIterator[Tuple[Str]]]
         map_(bind(tu0_plus_tu2)),                                     # IOResultE(MIterator[str])
         map_(lambda iterator : iterator.filter(normal_file)),              # IOResultE[MIterator[str]]
     )
 
 # upload_dir :: str -> IOResultE[MIterator[ReaderIOResultE[str]]]
 def upload_dir(directory):
-    return IOResultE.do(
-        flow(
-            files,                                                  # MIterator[str]
-            map_(pipe(conditional_upload, ReaderIOResultE)),        # MIterator[ReaderIOResultE[str]]
-        )
-        for files in collect_files(directory)
+    return IOSuccess(directory).map(
+        pipe(os.path.normcase, Path)
+    ).bind(
+        lambda path : IOSuccess(path) if path.is_dir() else IOFailure(f'"{path}" is not exists, thus can not be collected') 
+    ).bind(
+        collect_files                                                                   # IOResultE[MIterator[Path]]
+    ).map(
+        map_(pipe(conditional_upload, ReaderIOResultE))                                 # IOResultE[MIterator[ReaderIOResultE[str]]]
     )
 
 # oss_login :: dict -> IOResultE[oss2.Bucket]
 def oss_login(env):
-    # print(env)
     return flow(
-        IOResultE.from_value(curry(oss2.Bucket)),
+        IOSuccess(curry(oss2.Bucket)),
         IOResultE.from_ioresult(make_auth()).apply,
-        IOResultE.from_value(env['endpoint']).apply,
-        IOResultE.from_value(env['bucket']).apply
+        IOSuccess(env['endpoint']).apply,
+        IOSuccess(env['bucket']).apply
     )
 
 # read_config :: str -> IOResultE[dict]
@@ -267,9 +267,12 @@ def make_env(args):
 
 # win_callback :: MIterator[IOResultE[str]]
 def win_callback(iter_reader_ioresult):
+    count = 0
     for task in iter_reader_ioresult:
+        count += 1
         t = threading.Thread(target=task)
         t.start()
+
     return IOSuccess(0)
 
 # win_callback :: Exception -> IOResultE[None]
@@ -309,6 +312,11 @@ def main():
         return IOFailure('未指定的的命令')
 
 if __name__ == '__main__':
+    if os.name == 'nt':
+        get_key = nt_get_key
+    else:
+        get_key = posix_get_key
+
     try:
         main().lash(fail_callback).bind(win_callback)
     except KeyboardInterrupt:

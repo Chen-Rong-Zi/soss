@@ -58,6 +58,9 @@ python soss.py download -k my_password --output_dir ./data text.txt image.png
 ## 8月5日更新
 - feature: 新增多线程支持
 
+## 8月12日更新
+- feature: 兼容windows\unix
+
 ### LICENSE
 
 Copyright 2024 Tian Gao.
