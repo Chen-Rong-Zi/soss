@@ -132,7 +132,7 @@ def posix_get_key(path):
 # nt_get_key :: Path -> Reader[str]
 def nt_get_key(path):
     def with_identifier(identifier):
-        return identifier['hostname'] + '/' + os.path.normcase(path.as_posix())
+        return identifier['hostname'] + '/' + Path(os.path.normcase(str(path))).as_posix()
     return Reader(with_identifier)
 
 # upload_one :: str -> Reader[IOResultE[str]]
