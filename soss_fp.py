@@ -15,7 +15,7 @@ from   oss2.compat      import to_bytes
 
 import returns.pointfree  as     pointfree
 import returns.methods    as     methods
-from   returns.pointfree  import map_,      bind
+from   returns.pointfree  import map_,      bind, lash
 from   returns.io         import IOResultE, impure,       impure_safe,   IOFailure,      IOSuccess, IOResult
 from   returns.context    import Reader,    ReaderResult, ReaderResultE, ReaderIOResultE
 from   returns.result     import safe,      ResultE,      Failure,       Result
@@ -132,7 +132,8 @@ def posix_get_key(path):
 # nt_get_key :: Path -> Reader[str]
 def nt_get_key(path):
     def with_identifier(identifier):
-        return identifier['hostname'] + '/' + Path(os.path.normcase(str(path))).as_posix()
+        validate_key = pipe(str, os.path.normcase, Path, lambda x : x.as_posix())
+        return identifier['hostname'] + '/' + validate_key(path)
     return Reader(with_identifier)
 
 # upload_one :: str -> Reader[IOResultE[str]]
@@ -154,7 +155,7 @@ def get_remote_md5(key):
     # with_bucket :: bucket -> IO[ResultE[str]]
     def with_bucket(bucket):
         header_result = bucket.head_object(key)
-        return IOSuccess(safe_get('Content-Md5')(header_result.resp.headers))
+        return IOResultE.from_result(safe_get('Content-Md5')(header_result.resp.headers))
     return Reader(pipe(with_bucket, IOResultE.from_ioresult))
 
 # check_md5_integrity :: str -> Reader[IOResultE[bool]]
@@ -182,9 +183,7 @@ def conditional_upload(filepath):
         items   = list(env.items()) + [('key', get_key(filepath)(env['identifier']))]
         new_env = dict(items)
         return key_exists(new_env['key'])(env['bucket']).bind(
-            lambda exists : IOFailure('File Exists') if exists else IOSuccess("File Not Exists")
-        ).lash(
-            lambda _ : conditional_exit(filepath)(new_env)
+            lambda exists : conditional_exit(filepath)(new_env) if exists else IOSuccess("File Not Exists")
         ).bind(
             lambda _ : upload_one(filepath)(new_env)
         )
@@ -229,7 +228,7 @@ def upload_dir(directory):
     ).bind(
         collect_files                                                                   # IOResultE[MIterator[Path]]
     ).map(
-        map_(pipe(conditional_upload, ReaderIOResultE))                                 # IOResultE[MIterator[ReaderIOResultE[str]]]
+        map_(conditional_upload)                                                        # IOResultE[MIterator[Reader[IOResultE[str]]]]
     )
 
 # oss_login :: dict -> IOResultE[oss2.Bucket]
@@ -267,15 +266,16 @@ def make_env(args):
 
 # win_callback :: MIterator[IOResultE[str]]
 def win_callback(iter_reader_ioresult):
-    count = 0
+    threads = []
     for task in iter_reader_ioresult:
-        count += 1
         t = threading.Thread(target=task)
         t.start()
-
+        threads.append(t)
+        while len(threads) > 300:
+            threads = [th for th in threads if not th.is_alive()]
     return IOSuccess(0)
 
-# win_callback :: Exception -> IOResultE[None]
+# fail_callback :: Exception -> IOResultE[None]
 def fail_callback(error):
     return  IOFailure(print(error))
 
@@ -287,7 +287,11 @@ def upload(args):
         'identifier' : env['identifier']
     }
     return IOResultE.do(
-        iter_reader_ioresult.map(lambda reader : lambda :(reader(new_env(env, bucket))))
+        iter_reader_ioresult.map(
+            map_(lash(fail_callback))
+        ).map(
+            lambda reader : lambda : reader(new_env(env, bucket))
+        )
         for iter_reader_ioresult in upload_dir(args.directory)
         for env                  in make_env(args)
         for bucket               in oss_login(env['config'])
