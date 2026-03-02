@@ -8,6 +8,11 @@ import argparse
 import threading
 from   pathlib   import Path, PurePath
 
+import anyio
+import asyncio
+from anyio.to_thread import run_sync
+from typing import Iterator
+
 import oss2
 from   oss2.credentials import EnvironmentVariableCredentialsProvider
 from   oss2.utils       import content_md5
@@ -19,15 +24,33 @@ from   returns.pointfree  import map_,      bind, lash
 from   returns.io         import IOResultE, impure,       impure_safe,   IOFailure,      IOSuccess, IOResult
 from   returns.context    import Reader,    ReaderResult, ReaderResultE, ReaderIOResultE
 from   returns.result     import safe,      ResultE,      Failure,       Result
-from   returns.pipeline   import flow,      pipe
+from   returns.pipeline   import flow,      pipe, is_successful
 from   returns.iterables  import Fold
 from   returns.curry      import curry
+from   returns.maybe      import Nothing
 from   returns.converters import flatten
 # from viztracer          import VizTracer
 
 from   ListHelper         import lmap,      lfilter,   concat, ljoin
 from   multivalue         import MIterator, MultiValue
 from   md5                import calculate_md5 as get_local_md5
+
+def ioresult_retry(n):
+    def decorator(func):
+        def helper(*args, **kwargs):
+            for _ in range(n):
+                x = func(*args, **kwargs)
+                if not is_successful(x._inner_value):
+                    print(f"{x = }, 第{_ + 1}次尝试")
+                    continue
+                else:
+                    return x
+            if n:
+                return x
+        return helper
+    return decorator
+
+
 
 def ioresult_sequence(ioresult):
     if isinstance(ioresult, IOFailure):
@@ -70,6 +93,7 @@ def parse_json_ioresult(string):
 
 # str -> Reader[IOResultE[str], bucket]
 def key_exists(key):
+    @ioresult_retry(3)
     @impure_safe
     # with_bucket bucket -> bool
     def with_bucket(bucket):
@@ -83,7 +107,6 @@ def upload_data(key, data):
     @impure_safe
     def with_bucket(bucket):
         put_result = bucket.put_object(key, data)
-        print(f'{key} 上传成功')
         return f'{key} 上传成功'
     return Reader(with_bucket)
 
@@ -136,6 +159,21 @@ def nt_get_key(path):
         return identifier['hostname'] + '/' + validate_key(path)
     return Reader(with_identifier)
 
+# (write_error_log ::  Exception, dict, str=) -> IOFailure[str]
+@curry
+@impure_safe
+def write_error_log(env, exp, log_path="/tmp/soss.log"):
+    try:
+        with open(log_path, "a+", errors='ignore') as f:
+            f.write(f"{env['file_path']}:{env['key']} {exp}\n")
+    except Exception as e:
+        import traceback
+        traceback.print_exception(e)
+        traceback.print_stack()
+        f.write(f"{env['file_path']}:{env['key']} {exp}\n")
+        print()
+    raise (exp)
+
 # upload_one :: str -> Reader[IOResultE[str]]
 def upload_one(file_path):
     # with_env :: dict -> IOResultE[str]
@@ -150,12 +188,20 @@ def upload_one(file_path):
 def get_file_handler(filepath, mode='rb'):
     return open(filepath, mode)
 
+@impure_safe
+def get_last_modified_time(file_path):
+    path = Path(file_path)
+    return path.stat().st_mtime
+
 # get_remote_md5 :: str -> Reader[IOResultE(md5)]
 def get_remote_md5(key):
     # with_bucket :: bucket -> IO[ResultE[str]]
+    @ioresult_retry(3)
+    @impure_safe
     def with_bucket(bucket):
         header_result = bucket.head_object(key)
-        return IOResultE.from_result(safe_get('Content-Md5')(header_result.resp.headers))
+        # return IOResultE.from_result(safe_get('Content-Md5')(header_result.resp.headers))
+        return header_result.resp.headers['Content-Md5']
     return Reader(pipe(with_bucket, IOResultE.from_ioresult))
 
 # check_md5_integrity :: str -> Reader[IOResultE[bool]]
@@ -165,14 +211,39 @@ def check_md5_integrity(filepath):
             local_md5 == remote_md5
             for fhandle    in get_file_handler(filepath)
             for local_md5  in get_local_md5(fhandle)
-            for remote_md5 in get_remote_md5(env['key'])(env['bucket'])
+            for remote_md5 in IOResultE.from_result(safe_get("Content-Md5", env["headers"]))
         )
     return Reader(with_env)
 
+def head_object(key):
+    @ioresult_retry(3)
+    @impure_safe
+    def with_bucket(bucket):
+        header_result = bucket.head_object(key)
+        return header_result
+    return Reader(with_bucket)
+
 # conditional_exit :: str -> Reader[IOResultE[str]]
 def conditional_exit(filepath):
-    return check_md5_integrity(filepath).map(
-        bind(lambda pass_md5_verify : IOFailure(f'{filepath} 在oss中已存在!') if pass_md5_verify else IOSuccess(f'Did not Pass md5 verification'))
+    return Reader.ask().map(
+        lambda env: head_object(env["key"])(env["bucket"])
+    ).map(lambda ioresult_result:
+        (
+            IOResultE.do(
+                local_mtime <= remote_time
+                for remote_time in ioresult_result.map(lambda x: x.last_modified)
+                for local_mtime in get_last_modified_time(filepath)
+            ),
+            ioresult_result
+        )
+    ).bind(lambda ioresult_sync_ioresult_result:
+        Reader(lambda _: ioresult_sync_ioresult_result[0])
+           if not is_successful(ioresult_sync_ioresult_result[0]._inner_value)
+           else (
+               Reader(lambda _: IOResultE.from_value(f"oss已存在{filepath}"))
+                   if ioresult_sync_ioresult_result[0]._inner_value.unwrap()
+                   else Reader.ask().map(lambda _: check_md5_integrity(filepath)({"headers": ioresult_sync_ioresult_result[1]._inner_value.unwrap().resp.headers}))
+            )
     )
 
 # conditional_upload :: str -> Reader[IOResultE[str]]
@@ -185,13 +256,14 @@ def conditional_upload(filepath):
         return key_exists(new_env['key'])(env['bucket']).bind(
             lambda exists : conditional_exit(filepath)(new_env) if exists else IOSuccess("File Not Exists")
         ).bind(
-            lambda _ : upload_one(filepath)(new_env)
-        )
+            lambda has_object : upload_one(filepath)(new_env) if not has_object else IOSuccess(f'{filepath} 在oss中已存在!')
+        ).lash(write_error_log({**new_env, "file_path": filepath}))
     return Reader(with_env)
 
 # is_normal_file :: Path -> IOResultE[Path]
+@impure_safe
 def is_normal_file(path):
-    return IOSuccess(path.is_file())
+    return path.is_file()
 
 # truey_value :: IOResultE[any] -> bool
 def truey_value(ior_value):
@@ -219,16 +291,33 @@ def collect_files(directory_path):
         map_(lambda iterator : iterator.filter(normal_file)),              # IOResultE[MIterator[str]]
     )
 
+def upload_collection(collections):
+    return collections.map(
+        map_(conditional_upload)                                                        # IOResultE[MIterator[Reader[IOResultE[str]]]]
+    )
+
 # upload_dir :: str -> IOResultE[MIterator[ReaderIOResultE[str]]]
 def upload_dir(directory):
-    return IOSuccess(directory).map(
-        pipe(os.path.normcase, os.path.normpath, Path)
-    ).bind(
-        lambda path : IOSuccess(path) if path.is_dir() else IOFailure(f'"{path}" is not exists, thus can not be collected') 
-    ).bind(
-        collect_files                                                                   # IOResultE[MIterator[Path]]
-    ).map(
-        map_(conditional_upload)                                                        # IOResultE[MIterator[Reader[IOResultE[str]]]]
+    return upload_collection(
+        IOSuccess(directory).map(
+            pipe(os.path.normcase, os.path.normpath, Path)
+        ).bind(
+            lambda path : IOSuccess(path) if path.is_dir() else IOFailure(f'"{path}" is not exists, thus can not be collected') 
+        ).bind(
+            collect_files                                                                   # IOResultE[MIterator[Path]]
+        )
+    )
+
+# upload_file :: str -> IOResultE[MIterator[ReaderIOResultE[str]]]
+def upload_file(file):
+    return upload_collection(
+        IOSuccess(file).map(
+            pipe(os.path.normcase, os.path.normpath, Path)
+        ).bind(
+            lambda path : IOSuccess(path) if not path.is_dir() else IOFailure(f'"{path}" is not exists, thus can not be collected') 
+        ).bind(
+            pipe(MIterator.from_value, IOResultE.from_value)                                                                   # IOResultE[MIterator[Path]]
+        )
     )
 
 # oss_login :: dict -> IOResultE[oss2.Bucket]
@@ -266,14 +355,68 @@ def make_env(args):
 
 # win_callback :: MIterator[IOResultE[str]]
 def win_callback(iter_reader_ioresult):
+    import time
     threads = []
+    threads_count = 16
     for task in iter_reader_ioresult:
         t = threading.Thread(target=task)
         t.start()
         threads.append(t)
-        while len(threads) > 300:
-            threads = [th for th in threads if not th.is_alive()]
+        # t.join()
+        print("f")
+        while len(threads) > threads_count:
+            print(f"{threads_count = }")
+            threads = [th for th in threads if th.is_alive()]
+            length = len(threads)
+            if length == 0:
+                threads_count = threads_count * 2
+            elif length >= threads_count:
+                threads_count = max(threads_count - 1, 16)
+            else:
+                threads_count = threads_count + 1
+            time.sleep(0.5)
     return IOSuccess(0)
+
+def win_callback(iter_reader_ioresult: Iterator[IOResultE[str]]):
+    async def run_task(task):
+        return await run_sync(task)
+
+    async def main():
+        threads = []
+        threads_count = 16
+        for task in iter_reader_ioresult:
+            task = asyncio.create_task(run_task(task))
+            threads.append(task)
+
+            import sys
+            # print(f"{len(threads) = } {threads_count = }", file=sys.stderr)
+            while len(threads) > threads_count:
+                await anyio.sleep(0.5)
+                done_threads = [th for th in threads if th.done()]
+                threads = [th for th in threads if not th.done()]
+                # print(f"{len(threads) = }", file=sys.stderr)
+
+                if any(t.result()._inner_value.value_or(Nothing) is Nothing for t in done_threads):
+                    # print(f"存在失败结果", file=sys.stderr)
+                    threads_count = max(16, int(threads_count / 2))
+                    continue
+                length = len(threads)
+                if length == 0:
+                    # print(f"这轮任务完全结束 {threads_count = } -> {threads_count * 2}", file=sys.stderr)
+                    threads_count = threads_count * 2
+                elif length >= threads_count:
+                    # print(f"这轮任务不存在任务结束 {threads_count = } -> {max(threads_count - 1, 16)}", file=sys.stderr)
+                    threads_count = max(threads_count - 1, 16)
+                    # print(f"这轮任务 {threads_count = }", file=sys.stderr)
+                else:
+                    # print(f"这轮任务继续增加额度 {threads_count = } -> {threads_count + 1}", file=sys.stderr)
+                    threads_count = threads_count + 1
+        for t in threads:
+            await t
+
+    anyio.run(main)
+    return IOSuccess(0)
+
 
 # fail_callback :: Exception -> IOResultE[None]
 def fail_callback(error):
@@ -290,9 +433,15 @@ def upload(args):
         iter_reader_ioresult.map(
             map_(lash(fail_callback))
         ).map(
+            map_(map_(print))
+        ).map(
             lambda reader : lambda : reader(new_env(env, bucket))
         )
-        for iter_reader_ioresult in upload_dir(args.directory)
+        for iter_reader_ioresult in (
+            upload_dir(args.directory)
+            if Path(args.directory).is_dir()
+            else upload_file(args.directory)
+        )
         for env                  in make_env(args)
         for bucket               in oss_login(env['config'])
     )
